@@ -62,6 +62,8 @@ from openviking_cli.exceptions import (
 )
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.grep_config import GrepEngine
+from openviking_cli.utils.config.keyword_config import KeywordConfig
+from openviking.storage.keywordfs.keyword_fs import KeywordFS
 from openviking_cli.utils.logger import get_logger
 from openviking_cli.utils.uri import VikingURI
 
@@ -227,6 +229,8 @@ def init_viking_fs(
     vector_store: Optional["VikingVectorIndexBackend"] = None,
     retrieval_config: Optional["RetrievalConfig"] = None,
     grep_config: Optional["GrepConfig"] = None,
+    keyword_config: Optional["KeywordConfig"] = None,
+    keyword_fs: Optional["KeywordFS"] = None,
     timeout: int = 10,
     enable_recorder: bool = False,
     encryptor: Optional[Any] = None,
@@ -252,6 +256,8 @@ def init_viking_fs(
         vector_store=vector_store,
         retrieval_config=retrieval_config,
         grep_config=grep_config,
+        keyword_config=keyword_config,
+        keyword_fs=keyword_fs,
         encryptor=encryptor,
     )
 
@@ -328,6 +334,8 @@ class VikingFS:
         vector_store: Optional["VikingVectorIndexBackend"] = None,
         retrieval_config: Optional["RetrievalConfig"] = None,
         grep_config: Optional["GrepConfig"] = None,
+        keyword_config: Optional["KeywordConfig"] = None,
+        keyword_fs: Optional["KeywordFS"] = None,
         timeout: int = 10,
         encryptor: Optional[Any] = None,
     ):
@@ -338,6 +346,8 @@ class VikingFS:
         self.vector_store = vector_store
         self.retrieval_config = retrieval_config
         self.grep_config = grep_config
+        self.keyword_config = keyword_config
+        self._keyword_fs = keyword_fs
         self._encryptor = encryptor
         self._count_cache: Dict[str, tuple] = {}  # cache_key → (count, timestamp)
         self._count_cache_max_size = 1024
@@ -1106,7 +1116,7 @@ class VikingFS:
                 ctx=ctx,
                 content_transform=content_transform,
             )
-        else:  # "vikingdb_then_fs"
+        if resolved_engine == "vikingdb_then_fs":
             return await self._grep_vikingdb_then_fs(
                 uri=uri,
                 pattern=pattern,
@@ -1116,45 +1126,63 @@ class VikingFS:
                 level_limit=level_limit,
                 ctx=ctx,
             )
+        # "local_then_fs"
+        return await self._grep_local_then_fs(
+            uri=uri,
+            pattern=pattern,
+            exclude_uri=exclude_uri,
+            case_insensitive=case_insensitive,
+            node_limit=node_limit,
+            level_limit=level_limit,
+            ctx=ctx,
+        )
 
     async def _resolve_grep_engine(
         self, engine: GrepEngine, uri: str, ctx, switch_to_remote_threshold: int = 10000
     ) -> str:
-        """Resolve the actual grep engine to use."""
+        """Resolve the actual grep engine to use.
+
+        Resolution order for ``engine="auto"``:
+        1. remote VikingDB BM25 when the backend stores the ``content`` field and
+           the record count is at/above ``switch_to_remote_threshold``;
+        2. the local FTS5 keyword sidecar when enabled and ready;
+        3. filesystem scan.
+        """
         if engine == "fs":
             return "fs"
 
-        # auto mode: check vikingdb availability
         vector_store = self._get_vector_store()
-        if not vector_store:
-            return "fs"
+        remote_available = False
+        if vector_store is not None:
+            backend_type = getattr(vector_store, "_backend_type", "unknown")
+            # Keep this set consistent with ``CollectionAdapter.USE_CONTENT_FIELD``:
+            # only these backends store the ``content`` field required for full-text grep.
+            if backend_type in ("volcengine", "vikingdb"):
+                remote_available = await self._collection_has_fulltext(vector_store, ctx)
 
-        backend_type = getattr(vector_store, "_backend_type", "unknown")
-        # Keep this set consistent with ``CollectionAdapter.USE_CONTENT_FIELD``:
-        # only these backends store the ``content`` field required for full-text grep.
-        if backend_type not in ("volcengine", "vikingdb"):
-            return "fs"
+        if engine == "vikingdb":
+            if remote_available:
+                return "vikingdb_then_fs"
+            return "local_then_fs" if self._keyword_available(ctx) else "fs"
 
-        # Check collection has content field and FullText config
-        if not await self._collection_has_fulltext(vector_store, ctx):
-            return "fs"
+        if engine == "local":
+            return "local_then_fs" if self._keyword_available(ctx) else "fs"
 
-        # switch_to_remote_threshold=0 means always use vikingdb
-        if switch_to_remote_threshold == 0:
-            return "vikingdb_then_fs"
-
-        # Check data volume threshold
-        try:
-            count = await self._get_cached_count(uri, ctx)
-            if count < switch_to_remote_threshold:
-                return "fs"
-        except Exception:
-            logger.debug(
-                "grep engine=auto: count() check failed, falling back to fs", exc_info=True
-            )
-            return "fs"
-
-        return "vikingdb_then_fs"
+        # engine == "auto"
+        if remote_available:
+            # switch_to_remote_threshold=0 means always use vikingdb
+            if switch_to_remote_threshold == 0:
+                return "vikingdb_then_fs"
+            try:
+                count = await self._get_cached_count(uri, ctx)
+                if count >= switch_to_remote_threshold:
+                    return "vikingdb_then_fs"
+            except Exception:
+                logger.debug(
+                    "grep engine=auto: count() check failed, checking local keyword",
+                    exc_info=True,
+                )
+        return "local_then_fs" if self._keyword_available(ctx) else "fs"
 
     async def _collection_has_fulltext(self, vector_store, ctx) -> bool:
         """Check if collection has content field and FullText config.
@@ -1324,6 +1352,82 @@ class VikingFS:
             return {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
 
         # Step 2: local fs precise matching on candidate files
+        return await self._grep_in_files(
+            candidate_uris,
+            pattern,
+            case_insensitive,
+            node_limit,
+            ctx,
+        )
+
+    async def _grep_local_then_fs(
+        self,
+        uri: str,
+        pattern: str,
+        exclude_uri: Optional[str],
+        case_insensitive: bool,
+        node_limit: Optional[int],
+        level_limit: int,
+        ctx: Optional[RequestContext] = None,
+    ) -> Dict:
+        """Local FTS5 keyword recall + local fs precise matching.
+
+        Mirrors ``_grep_vikingdb_then_fs`` but recalls candidate URIs from the
+        local SQLite FTS5 sidecar instead of a remote VikingDB BM25 index. The
+        final regex match always runs against the on-disk content
+        (``_grep_in_files``), so the sidecar only accelerates recall.
+        """
+        kfs = self._get_keyword_fs()
+        if kfs is None or not self._keyword_available(ctx):
+            return await self._grep_fs(
+                uri=uri,
+                pattern=pattern,
+                exclude_uri=exclude_uri,
+                case_insensitive=case_insensitive,
+                node_limit=node_limit,
+                level_limit=level_limit,
+                ctx=ctx,
+            )
+
+        real_ctx = self._ctx_or_default(ctx)
+        query = " ".join(kw.strip() for kw in pattern.split("|") if kw.strip())
+        if not query.strip():
+            return await self._grep_fs(
+                uri=uri,
+                pattern=pattern,
+                exclude_uri=exclude_uri,
+                case_insensitive=case_insensitive,
+                node_limit=node_limit,
+                level_limit=level_limit,
+                ctx=ctx,
+            )
+
+        remote_return_limit = min(node_limit * 5, 100000) if node_limit else 100000
+        try:
+            candidates = kfs.lookup(
+                account_id=real_ctx.account_id,
+                query=query,
+                scope_uri=uri,
+                exclude_uri=exclude_uri.rstrip("/") if exclude_uri else "",
+                limit=remote_return_limit,
+            )
+        except Exception as e:
+            logger.warning(f"grep local keyword recall failed, falling back to fs: {e}")
+            return await self._grep_fs(
+                uri=uri,
+                pattern=pattern,
+                exclude_uri=exclude_uri,
+                case_insensitive=case_insensitive,
+                node_limit=node_limit,
+                level_limit=level_limit,
+                ctx=ctx,
+            )
+
+        candidate_uris = [u for u, _score in candidates]
+        if not candidate_uris:
+            # The keyword index confirms no matching content.
+            return {"matches": [], "count": 0, "match_count": 0, "files_scanned": 0}
+
         return await self._grep_in_files(
             candidate_uris,
             pattern,
@@ -2150,6 +2254,7 @@ class VikingFS:
         ctx: Optional[RequestContext] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        hybrid: Optional[bool] = None,
     ):
         """Semantic search.
 
@@ -2218,15 +2323,24 @@ class VikingFS:
             level=level,
         )
 
-        # Convert QueryResult to FindResult
+        matched_contexts = await self._maybe_hybrid_keyword(
+            query,
+            result.matched_contexts,
+            retrieval_targets.target_directories,
+            real_ctx,
+            limit,
+            override=hybrid,
+        )
+
+        # Convert to FindResult
         memories, resources, skills = [], [], []
-        for ctx in result.matched_contexts:
-            if ctx.context_type == ContextType.MEMORY:
-                memories.append(ctx)
-            elif ctx.context_type == ContextType.RESOURCE:
-                resources.append(ctx)
-            elif ctx.context_type == ContextType.SKILL:
-                skills.append(ctx)
+        for mc in matched_contexts:
+            if mc.context_type == ContextType.MEMORY:
+                memories.append(mc)
+            elif mc.context_type == ContextType.RESOURCE:
+                resources.append(mc)
+            elif mc.context_type == ContextType.SKILL:
+                skills.append(mc)
 
         find_result = FindResult(
             memories=memories,
@@ -2247,6 +2361,7 @@ class VikingFS:
         ctx: Optional[RequestContext] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        hybrid: Optional[bool] = None,
     ):
         """Complex search with session context.
 
@@ -2366,14 +2481,25 @@ class VikingFS:
 
         # Aggregate results to FindResult
         memories, resources, skills = [], [], []
+        flat = []
         for result in query_results:
-            for ctx in result.matched_contexts:
-                if ctx.context_type == ContextType.MEMORY:
-                    memories.append(ctx)
-                elif ctx.context_type == ContextType.RESOURCE:
-                    resources.append(ctx)
-                elif ctx.context_type == ContextType.SKILL:
-                    skills.append(ctx)
+            flat.extend(result.matched_contexts)
+        if flat:
+            flat = await self._maybe_hybrid_keyword(
+                query,
+                flat,
+                retrieval_targets.target_directories,
+                real_ctx,
+                limit,
+                override=hybrid,
+            )
+        for mc in flat:
+            if mc.context_type == ContextType.MEMORY:
+                memories.append(mc)
+            elif mc.context_type == ContextType.RESOURCE:
+                resources.append(mc)
+            elif mc.context_type == ContextType.SKILL:
+                skills.append(mc)
 
         find_result = FindResult(
             memories=memories,
@@ -3104,6 +3230,51 @@ class VikingFS:
             logger.warning(f"[VikingFS] Failed to delete from vector store: {e}")
             raise
 
+        await self._enqueue_keyword_delete(uris, ctx)
+
+    def _keyword_indexing_wired(self) -> bool:
+        """True when the keyword sidecar should receive mutations."""
+        if not self.keyword_config or not self.keyword_config.enabled:
+            return False
+        if self.keyword_config.respect_encryption and self._encryptor is not None:
+            return False
+        return self._get_keyword_fs() is not None
+
+    async def _enqueue_keyword_delete(self, uris: List[str], ctx) -> None:
+        """Best-effort enqueue of keyword delete messages (fire-and-forget)."""
+        if not self._keyword_indexing_wired() or not uris:
+            return
+        try:
+            from openviking.storage.keywordfs.keyword_msg import Delete, KeywordMsg
+            from openviking.storage.queuefs.queue_manager import get_queue_manager
+
+            qm = get_queue_manager()
+            queue = qm.get_queue(qm.KEYWORD)
+            real_ctx = self._ctx_or_default(ctx)
+            for u in uris:
+                await queue.enqueue(KeywordMsg(kind=Delete, uri=u, account_id=real_ctx.account_id))
+        except Exception as e:
+            logger.warning(f"[VikingFS] Failed to enqueue keyword deletes: {e}")
+
+    async def _enqueue_keyword_move(self, uris: List[str], old_base: str, new_base: str, ctx) -> None:
+        """Best-effort enqueue of keyword move messages (fire-and-forget)."""
+        if not self._keyword_indexing_wired() or not uris:
+            return
+        try:
+            from openviking.storage.keywordfs.keyword_msg import KeywordMsg, Move
+            from openviking.storage.queuefs.queue_manager import get_queue_manager
+
+            qm = get_queue_manager()
+            queue = qm.get_queue(qm.KEYWORD)
+            real_ctx = self._ctx_or_default(ctx)
+            for u in uris:
+                new_uri = new_base + u[len(old_base):]
+                await queue.enqueue(
+                    KeywordMsg(kind=Move, old_uri=u, new_uri=new_uri, account_id=real_ctx.account_id)
+                )
+        except Exception as e:
+            logger.warning(f"[VikingFS] Failed to enqueue keyword moves: {e}")
+
     async def _update_vector_store_uris(
         self,
         uris: List[str],
@@ -3133,6 +3304,8 @@ class VikingFS:
             except Exception as e:
                 logger.warning(f"[VikingFS] Failed to update {uri} in vector store: {e}")
 
+        await self._enqueue_keyword_move(uris, old_base, new_base, ctx)
+
     def _get_vector_store(self) -> Optional["VikingVectorIndexBackend"]:
         """Get vector store instance."""
         return self.vector_store
@@ -3140,6 +3313,75 @@ class VikingFS:
     def _get_embedder(self) -> Any:
         """Get embedder instance."""
         return self.query_embedder
+
+    def _get_keyword_fs(self) -> Optional[KeywordFS]:
+        """Get the keyword sidecar instance (may be None when disabled)."""
+        return self._keyword_fs
+
+    def set_keyword_fs(self, keyword_fs: Optional[KeywordFS]) -> None:
+        """Attach the keyword sidecar (for deferred initialization)."""
+        self._keyword_fs = keyword_fs
+
+    async def _maybe_hybrid_keyword(
+        self,
+        query: str,
+        matched: List[Any],
+        target_directories: List[str],
+        ctx: RequestContext,
+        limit: int,
+        override: Optional[bool] = None,
+    ) -> List[Any]:
+        """Fuse keyword-sidecar recall into dense results when hybrid is enabled."""
+        hybrid_cfg = (
+            getattr(self.retrieval_config, "hybrid", None) if self.retrieval_config else None
+        )
+        enabled = (
+            override
+            if override is not None
+            else bool(hybrid_cfg and getattr(hybrid_cfg, "enabled", False))
+        )
+        if not enabled:
+            return matched
+        kfs = self._get_keyword_fs()
+        if kfs is None or not self._keyword_indexing_wired():
+            return matched
+        try:
+            from openviking.retrieve.hybrid_keyword import HybridKeywordRecaller
+
+            recaller = HybridKeywordRecaller(kfs, hybrid_cfg, self.keyword_config)
+            if not recaller.enabled(ctx):
+                return matched
+            return await recaller.enhance(
+                query=query,
+                dense=matched,
+                scope_uris=target_directories or [""],
+                ctx=ctx,
+                limit=limit,
+                read_abstract=lambda uri: self.abstract(uri, ctx=ctx),
+            )
+        except Exception:
+            logger.exception("[VikingFS] hybrid keyword fusion failed; using dense results")
+            return matched
+
+    def _keyword_available(self, ctx: Optional[RequestContext] = None) -> bool:
+        """True when the local keyword sidecar is enabled, safe and ready.
+
+        Disabled when: the config switch is off, at-rest encryption is on and
+        ``respect_encryption`` is set, the sidecar instance is missing, or the
+        current account's sidecar DB is not built yet.
+        """
+        if not self.keyword_config or not self.keyword_config.enabled:
+            return False
+        if self.keyword_config.respect_encryption and self._encryptor is not None:
+            return False
+        kfs = self._get_keyword_fs()
+        if kfs is None:
+            return False
+        real_ctx = self._ctx_or_default(ctx)
+        try:
+            return kfs.is_ready(real_ctx.account_id)
+        except Exception:
+            return False
 
     # ========== Parent Directory Creation ==========
 
@@ -4428,6 +4670,7 @@ class VikingFS:
 
         tasks = self._collect_restore_vector_tasks(written, deleted)
         if not tasks:
+            self._schedule_keyword_rebuild(written=written, deleted=deleted, ctx=ctx)
             return
 
         executor = get_reindex_executor()
@@ -4436,6 +4679,61 @@ class VikingFS:
                 self._run_vector_rebuild(executor, op, uri, level, ctx),
                 name=f"vikingfs-git-{op}:{uri}:{int(level)}",
             )
+
+        # Keep the keyword sidecar consistent with the restored tree: drop any
+        # pre-restore rows under the affected paths; the reindex above re-emits
+        # embedding messages that co-enqueue fresh keyword upserts afterwards.
+        self._schedule_keyword_rebuild(written=written, deleted=deleted, ctx=ctx)
+
+    def _schedule_keyword_rebuild(
+        self,
+        *,
+        written: List[str],
+        deleted: List[str],
+        ctx: RequestContext,
+    ) -> None:
+        """Fire-and-forget keyword-sidecar cleanup for a git restore.
+
+        Rows under every written/deleted path are dropped (via the FIFO keyword
+        queue), then the restore-triggered reindex re-enqueues fresh keyword
+        upserts through the embedding pipeline. Failures are logged and never
+        propagate.
+        """
+        if not self._keyword_indexing_wired():
+            return
+        affected = list(dict.fromkeys([*written, *deleted]))
+        if not affected:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("[VikingFS] git restore keyword rebuild skipped: no running event loop")
+            return
+
+        loop.create_task(
+            self._run_keyword_restore_cleanup(affected, ctx),
+            name=f"vikingfs-git-keyword:{ctx.account_id}",
+        )
+
+    async def _run_keyword_restore_cleanup(self, uris: List[str], ctx: RequestContext) -> None:
+        """Enqueue keyword delete_prefix messages for the restored paths."""
+        if not self._keyword_indexing_wired() or not uris:
+            return
+        try:
+            from openviking.storage.keywordfs.keyword_msg import KeywordMsg, DeletePrefix
+            from openviking.storage.queuefs.queue_manager import get_queue_manager
+
+            qm = get_queue_manager()
+            queue = qm.get_queue(qm.KEYWORD)
+            real_ctx = self._ctx_or_default(ctx)
+            for u in uris:
+                # delete_prefix semantics: URI LIKE '<u>%' removes the exact row
+                # and any subtree rows.
+                await queue.enqueue(
+                    KeywordMsg(kind=DeletePrefix, uri=u, account_id=real_ctx.account_id)
+                )
+        except Exception as e:
+            logger.warning(f"[VikingFS] Failed to enqueue keyword restore cleanup: {e}")
 
     async def _run_restore_rebuild_tracked(
         self,

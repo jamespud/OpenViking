@@ -88,6 +88,7 @@ class SearchService:
         filter: Optional[Dict] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        hybrid: Optional[bool] = None,
     ) -> Any:
         """Complex search with session context.
 
@@ -123,6 +124,7 @@ class SearchService:
             filter=filter,
             level=level,
             image_url=resolved_image_url,
+            hybrid=hybrid,
         )
         return result
 
@@ -136,6 +138,7 @@ class SearchService:
         filter: Optional[Dict] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        hybrid: Optional[bool] = None,
     ) -> Any:
         """Semantic search without session context.
 
@@ -163,5 +166,6 @@ class SearchService:
             filter=filter,
             level=level,
             image_url=resolved_image_url,
+            hybrid=hybrid,
         )
         return result
